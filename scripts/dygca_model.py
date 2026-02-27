@@ -271,7 +271,9 @@ class DyGCAPlugin(nn.Module):
         else:
             # Optional Chunk Self-Attention
             weighted_tokens = base.unsqueeze(1).unsqueeze(2) * probs.unsqueeze(-1)
-            attn_in = weighted_tokens.view(bsz * seq_len * self.config.k_focuses, seq_len, -1)
+            # RuntimeError: view size is not compatible with input tensor's size and stride
+            # 使用 .reshape() 代替 .view()，或者在 .view() 前调用 .contiguous()
+            attn_in = weighted_tokens.reshape(bsz * seq_len * self.config.k_focuses, seq_len, -1)
             attn_out, _ = self.chunk_attn(attn_in, attn_in, attn_in, need_weights=False)
             attn_out = attn_out.view(bsz, seq_len, self.config.k_focuses, seq_len, -1)
             # Apply importance magnitude after chunk attention
