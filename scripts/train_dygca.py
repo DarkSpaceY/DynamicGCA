@@ -14,7 +14,7 @@ from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
-from huggingface_hub import try_to_load_from_cache, _CACHED_NO_EXIST
+from scripts.utils import is_model_cached, is_dataset_cached
 
 from dygca_model import DyGCAConfig, DyGCAPlugin
 
@@ -331,35 +331,6 @@ def validate_step(model: DyGCAPlugin, dataloader: DataLoader, device: torch.devi
     return total_correct / (total_samples + 1e-9)
 
 
-def is_model_cached(model_name: str) -> bool:
-    """Check if the model is available in the local Hugging Face cache."""
-    # If it's a local path that exists, return True
-    if os.path.isdir(model_name):
-        return True
-    
-    # Try to find a key file (like config.json) in the cache
-    try:
-        # Use try_to_load_from_cache to check for the presence of config.json
-        filepath = try_to_load_from_cache(model_name, "config.json")
-        if filepath is not None and filepath != _CACHED_NO_EXIST:
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def is_dataset_cached(dataset_name: str, config: str = None) -> bool:
-    """Check if the dataset is available in the local cache."""
-    if os.path.isdir(dataset_name):
-        return True
-    try:
-        # Attempt to load metadata/config with local_files_only
-        load_dataset(dataset_name, config, local_files_only=True)
-        return True
-    except:
-        return False
-
-
 def main() -> int:
     args = parse_args()
     set_seed(args.seed)
@@ -389,7 +360,15 @@ def main() -> int:
     if dataset_cached:
         print(f"Detected cached dataset: {args.dataset}, using local_files_only=True")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True, local_files_only=model_cached)
+    # 模型加载参数
+    model_kwargs = {
+        "use_fast": True,
+        "trust_remote_code": True,
+    }
+    if model_cached:
+        model_kwargs["local_files_only"] = True
+    
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model, **model_kwargs)
     
     # 3. Qwen 特有 EOS/PAD 处理
     if "qwen" in args.base_model.lower():
@@ -401,10 +380,18 @@ def main() -> int:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
+    # 加载数据集：仅在检测到本地缓存时才强制 local_files_only=True
+    # 避免在未缓存时传递 local_files_only=False，某些 datasets 版本会误解析该参数
+    load_kwargs = {"split": args.split}
+    if args.config:
+        load_kwargs["name"] = args.config
+    if dataset_cached:
+        load_kwargs["local_files_only"] = True
+
     if "babi" in args.dataset.lower():
         print(f"Loading bAbI dataset: {args.dataset}")
         # 从 train split 中划分 val，避免 test 数据泄露
-        full_dataset = load_dataset(args.dataset, split=args.split, local_files_only=dataset_cached)
+        full_dataset = load_dataset(args.dataset, **load_kwargs)
         
         # 仅保留事实类任务 (Fact-based tasks: 1, 2, 3, 6, 10, 11, 12, 13)
         fact_tasks = {1, 2, 3, 6, 10, 11, 12, 13}
@@ -470,12 +457,18 @@ def main() -> int:
         # 非 bAbI 数据集暂时不启用验证集早停，或者可以根据需要后续添加
         val_dataloader = None
 
+    # 2. Load Model
+    base_model_kwargs = {
+        "torch_dtype": torch.float16 if device.type != "cpu" else torch.float32,
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True
+    }
+    if model_cached:
+        base_model_kwargs["local_files_only"] = True
+        
     base_model = AutoModelForCausalLM.from_pretrained(
-        args.base_model, 
-        torch_dtype=torch.float16 if device.type != "cpu" else torch.float32, 
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-        local_files_only=model_cached
+        args.base_model,
+        **base_model_kwargs
     ).to(device)
 
     # 1. Apply LoRA to base model (bAbI fine-tuning strategy)

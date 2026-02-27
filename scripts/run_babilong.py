@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 import torch
-from huggingface_hub import try_to_load_from_cache, _CACHED_NO_EXIST
+from scripts.utils import is_model_cached, is_dataset_cached
 
 from dygca_model import DyGCAConfig, DyGCAPlugin
 
@@ -156,25 +156,6 @@ def build_generator(tokenizer, base_model, device: torch.device):
     return generate_fn
 
 
-def is_model_cached(model_name: str) -> bool:
-    """Check if the model is available in the local Hugging Face cache."""
-    if os.path.isdir(model_name): return True
-    try:
-        filepath = try_to_load_from_cache(model_name, "config.json")
-        return filepath is not None and filepath != _CACHED_NO_EXIST
-    except: return False
-
-
-def is_dataset_cached(dataset_name: str, config: str = None) -> bool:
-    """Check if the dataset is available in the local cache."""
-    if os.path.isdir(dataset_name): return True
-    try:
-        from datasets import load_dataset
-        load_dataset(dataset_name, config, local_files_only=True)
-        return True
-    except: return False
-
-
 def main() -> int:
     args = parse_args()
     load_dataset_fn, AutoModelForCausalLM, AutoTokenizer, pipeline = load_deps()
@@ -185,17 +166,22 @@ def main() -> int:
     if model_cached: print(f"Detected cached model: {args.model}, using local_files_only=True")
     if dataset_cached: print(f"Detected cached dataset: RMT-team/babilong, using local_files_only=True")
 
-    dataset = load_dataset_fn("RMT-team/babilong", args.config, local_files_only=dataset_cached)
+    load_kwargs = {"local_files_only": True} if dataset_cached else {}
+    dataset = load_dataset_fn("RMT-team/babilong", args.config, **load_kwargs)
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()] if args.tasks else [args.task]
     missing = [t for t in tasks if t not in dataset]
     if missing:
         print(f"Task {missing} not found. Available: {list(dataset.keys())}")
         return 1
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True, trust_remote_code=True, local_files_only=model_cached)
+    model_kwargs = {"use_fast": True, "trust_remote_code": True}
+    if model_cached: model_kwargs["local_files_only"] = True
+    tokenizer = AutoTokenizer.from_pretrained(args.model, **model_kwargs)
     generator = None
     if args.dygca_checkpoint:
-        base_model = AutoModelForCausalLM.from_pretrained(args.model, trust_remote_code=True, local_files_only=model_cached)
+        base_model_kwargs = {"trust_remote_code": True}
+        if model_cached: base_model_kwargs["local_files_only"] = True
+        base_model = AutoModelForCausalLM.from_pretrained(args.model, **base_model_kwargs)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         base_model.to(device)
         checkpoint = torch.load(args.dygca_checkpoint, map_location="cpu")
@@ -207,7 +193,9 @@ def main() -> int:
         plugin.load_state_dict(plugin_state, strict=False)
         generator = build_generator(tokenizer, plugin, device)
     else:
-        model = AutoModelForCausalLM.from_pretrained(args.model, device_map=args.device, trust_remote_code=True, local_files_only=model_cached)
+        base_model_kwargs = {"device_map": args.device, "trust_remote_code": True}
+        if model_cached: base_model_kwargs["local_files_only"] = True
+        model = AutoModelForCausalLM.from_pretrained(args.model, **base_model_kwargs)
         generator = pipeline("text-generation", model=model, tokenizer=tokenizer, device_map=args.device)
 
     results = []
