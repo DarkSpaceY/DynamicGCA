@@ -302,7 +302,8 @@ def train_step(model: DyGCAPlugin, batch: dict[str, torch.Tensor], device: torch
     loss = outputs["loss"] / grad_accum_steps
     loss.backward()
     
-    return {
+    # 立即提取需要的数据并释放 Tensor
+    res = {
         "loss": float(outputs["loss"].item()),
         "lm_loss": float(outputs["lm_loss"].item()),
         "diversity_loss": float(outputs["diversity_loss"].item()),
@@ -310,6 +311,11 @@ def train_step(model: DyGCAPlugin, batch: dict[str, torch.Tensor], device: torch
         "correct_tokens": int(correct.sum().item()),
         "total_tokens": int(mask.sum().item()),
     }
+    
+    # 显式清理大 Tensor 以便 GC 回收
+    del outputs, logits, shift_logits, shift_labels, mask, preds, correct, input_ids, labels, attention_mask
+    
+    return res
 
 
 def set_seed(seed: int):
@@ -600,6 +606,12 @@ def main() -> int:
                 
                 accum_loss = 0.0
                 accum_accuracy = 0.0
+                
+                # 显存清理：在每次权重更新后清理缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
 
             elif (micro_step + 1) % 10 == 0:
                 # 中间微步仅更新 postfix
