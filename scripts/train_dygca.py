@@ -14,6 +14,7 @@ from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
+from huggingface_hub import try_to_load_from_cache, _CACHED_NO_EXIST
 
 from dygca_model import DyGCAConfig, DyGCAPlugin
 
@@ -46,7 +47,10 @@ class BabiDataset(Dataset):
             if isinstance(ids_or_str, str):
                 return self.tokenizer.encode(ids_or_str, add_special_tokens=False)
             if torch.is_tensor(ids_or_str):
-                return ids_or_str.tolist()
+                return ids_or_str.detach().cpu().tolist()
+            # 处理 nested list 的情况 (某些 tokenizer 可能返回 [[ids]])
+            if isinstance(ids_or_str, (list, tuple)) and len(ids_or_str) > 0 and isinstance(ids_or_str[0], (list, tuple)):
+                return list(ids_or_str[0])
             return list(ids_or_str)
 
         res = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
@@ -57,7 +61,17 @@ class BabiDataset(Dataset):
         p_res = self.tokenizer.apply_chat_template(prompt_messages, tokenize=True, add_generation_prompt=True)
         prompt_ids = to_list(p_res)
         
-        full_ids_tensor = torch.tensor(full_ids, dtype=torch.long)
+        # 3. 转换为 Tensor 并进行类型检查
+        try:
+            full_ids_tensor = torch.tensor(full_ids, dtype=torch.long)
+        except Exception as e:
+            # 最后的防线：如果还是失败，尝试强制转换每个元素
+            try:
+                full_ids_tensor = torch.tensor([int(x) for x in full_ids], dtype=torch.long)
+            except:
+                print(f"Failed to convert full_ids: {full_ids}")
+                raise e
+
         labels = full_ids_tensor.clone()
         
         # 3. Label Masking
@@ -317,6 +331,35 @@ def validate_step(model: DyGCAPlugin, dataloader: DataLoader, device: torch.devi
     return total_correct / (total_samples + 1e-9)
 
 
+def is_model_cached(model_name: str) -> bool:
+    """Check if the model is available in the local Hugging Face cache."""
+    # If it's a local path that exists, return True
+    if os.path.isdir(model_name):
+        return True
+    
+    # Try to find a key file (like config.json) in the cache
+    try:
+        # Use try_to_load_from_cache to check for the presence of config.json
+        filepath = try_to_load_from_cache(model_name, "config.json")
+        if filepath is not None and filepath != _CACHED_NO_EXIST:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def is_dataset_cached(dataset_name: str, config: str = None) -> bool:
+    """Check if the dataset is available in the local cache."""
+    if os.path.isdir(dataset_name):
+        return True
+    try:
+        # Attempt to load metadata/config with local_files_only
+        load_dataset(dataset_name, config, local_files_only=True)
+        return True
+    except:
+        return False
+
+
 def main() -> int:
     args = parse_args()
     set_seed(args.seed)
@@ -337,7 +380,16 @@ def main() -> int:
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True)
+    # 检测模型和数据集是否已缓存
+    model_cached = is_model_cached(args.base_model)
+    dataset_cached = is_dataset_cached(args.dataset, args.config)
+    
+    if model_cached:
+        print(f"Detected cached model: {args.base_model}, using local_files_only=True")
+    if dataset_cached:
+        print(f"Detected cached dataset: {args.dataset}, using local_files_only=True")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, trust_remote_code=True, local_files_only=model_cached)
     
     # 3. Qwen 特有 EOS/PAD 处理
     if "qwen" in args.base_model.lower():
@@ -352,7 +404,7 @@ def main() -> int:
     if "babi" in args.dataset.lower():
         print(f"Loading bAbI dataset: {args.dataset}")
         # 从 train split 中划分 val，避免 test 数据泄露
-        full_dataset = load_dataset(args.dataset, split=args.split)
+        full_dataset = load_dataset(args.dataset, split=args.split, local_files_only=dataset_cached)
         
         # 仅保留事实类任务 (Fact-based tasks: 1, 2, 3, 6, 10, 11, 12, 13)
         fact_tasks = {1, 2, 3, 6, 10, 11, 12, 13}
@@ -422,8 +474,9 @@ def main() -> int:
         args.base_model, 
         torch_dtype=torch.float16 if device.type != "cpu" else torch.float32, 
         trust_remote_code=True,
-        low_cpu_mem_usage=True
-    )
+        low_cpu_mem_usage=True,
+        local_files_only=model_cached
+    ).to(device)
 
     # 1. Apply LoRA to base model (bAbI fine-tuning strategy)
     if args.use_lora:
