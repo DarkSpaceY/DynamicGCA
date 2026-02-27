@@ -43,15 +43,19 @@ class BabiDataset(Dataset):
         ]
         
         # 1. Tokenization (显式指定 tokenize=True)
-        def to_list(ids_or_str):
-            if isinstance(ids_or_str, str):
-                return self.tokenizer.encode(ids_or_str, add_special_tokens=False)
-            if torch.is_tensor(ids_or_str):
-                return ids_or_str.detach().cpu().tolist()
+        def to_list(ids_or_res):
+            # 处理返回 BatchEncoding (字典) 的情况
+            if isinstance(ids_or_res, dict) and "input_ids" in ids_or_res:
+                ids_or_res = ids_or_res["input_ids"]
+            
+            if isinstance(ids_or_res, str):
+                return self.tokenizer.encode(ids_or_res, add_special_tokens=False)
+            if torch.is_tensor(ids_or_res):
+                return ids_or_res.detach().cpu().tolist()
             # 处理 nested list 的情况 (某些 tokenizer 可能返回 [[ids]])
-            if isinstance(ids_or_str, (list, tuple)) and len(ids_or_str) > 0 and isinstance(ids_or_str[0], (list, tuple)):
-                return list(ids_or_str[0])
-            return list(ids_or_str)
+            if isinstance(ids_or_res, (list, tuple)) and len(ids_or_res) > 0 and isinstance(ids_or_res[0], (list, tuple)):
+                return list(ids_or_res[0])
+            return list(ids_or_res)
 
         res = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
         full_ids = to_list(res)
