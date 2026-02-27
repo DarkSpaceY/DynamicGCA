@@ -51,11 +51,12 @@ class BabiDataset(Dataset):
         def to_list(ids_or_res, name="unknown"):
             if self._debug_count < 1:
                 print(f"  [DEBUG to_list Input ({name})]: type={type(ids_or_res)}")
-                if isinstance(ids_or_res, dict):
-                    print(f"  [DEBUG to_list Keys]: {list(ids_or_res.keys())}")
             
-            # 处理返回 BatchEncoding (字典) 的情况
-            if isinstance(ids_or_res, dict) and "input_ids" in ids_or_res:
+            # 处理返回 BatchEncoding (字典或类字典对象) 的情况
+            # 不再使用 isinstance(ids_or_res, dict)，因为 BatchEncoding 可能继承自 UserDict
+            if hasattr(ids_or_res, "keys") and "input_ids" in ids_or_res:
+                if self._debug_count < 1:
+                    print(f"  [DEBUG to_list Mapping detected, keys: {list(ids_or_res.keys())}]")
                 ids_or_res = ids_or_res["input_ids"]
             
             if isinstance(ids_or_res, str):
@@ -72,7 +73,16 @@ class BabiDataset(Dataset):
                 if self._debug_count < 1: print(f"  [DEBUG to_list Nested List]: {res[:10]}...")
                 return res
             
-            res = list(ids_or_res)
+            # 最后的检查：如果还是列表，确保元素是 int 而不是键名
+            try:
+                res = [int(x) for x in ids_or_res]
+            except (ValueError, TypeError):
+                # 如果强制转换失败，说明可能还是字典的键
+                if hasattr(ids_or_res, "__getitem__") and "input_ids" in ids_or_res:
+                     res = [int(x) for x in ids_or_res["input_ids"]]
+                else:
+                     raise ValueError(f"Could not convert {name} to list of ints. Data: {ids_or_res}")
+
             if self._debug_count < 1: print(f"  [DEBUG to_list Final List]: {res[:10]}...")
             return res
 
@@ -499,7 +509,7 @@ def main() -> int:
 
     # 2. Load Model
     base_model_kwargs = {
-        "torch_dtype": torch.float16 if device.type != "cpu" else torch.float32,
+        "dtype": torch.float16 if device.type != "cpu" else torch.float32,
         "trust_remote_code": True,
         "low_cpu_mem_usage": True
     }
