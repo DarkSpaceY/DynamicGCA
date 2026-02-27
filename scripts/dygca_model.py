@@ -210,6 +210,7 @@ class DyGCAPlugin(nn.Module):
         
         outputs = self.base_model(
             input_ids=input_ids,
+            labels=labels,
             attention_mask=attention_mask,
             output_hidden_states=True,
             use_cache=False,
