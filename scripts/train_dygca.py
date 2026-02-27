@@ -44,8 +44,13 @@ class BabiDataset(Dataset):
         
         # 1. Tokenization (显式指定 tokenize=True)
         def to_list(ids_or_res):
+            # 调试日志：查看输入类型和前几个元素
+            # print(f"DEBUG: to_list input type: {type(ids_or_res)}")
+            
             # 处理返回 BatchEncoding (字典) 的情况
-            if isinstance(ids_or_res, dict) and "input_ids" in ids_or_res:
+            if hasattr(ids_or_res, "input_ids"): # 某些 BatchEncoding 是对象
+                ids_or_res = ids_or_res["input_ids"]
+            elif isinstance(ids_or_res, dict) and "input_ids" in ids_or_res:
                 ids_or_res = ids_or_res["input_ids"]
             
             if isinstance(ids_or_res, str):
@@ -55,7 +60,13 @@ class BabiDataset(Dataset):
             # 处理 nested list 的情况 (某些 tokenizer 可能返回 [[ids]])
             if isinstance(ids_or_res, (list, tuple)) and len(ids_or_res) > 0 and isinstance(ids_or_res[0], (list, tuple)):
                 return list(ids_or_res[0])
-            return list(ids_or_res)
+            
+            # 最后的保险：如果还是字典或非列表，强制转换前打印
+            try:
+                return list(ids_or_res)
+            except Exception as e:
+                print(f"DEBUG ERROR: Failed to convert to list. Type: {type(ids_or_res)}, Value: {str(ids_or_res)[:200]}")
+                raise e
 
         res = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
         full_ids = to_list(res)
@@ -64,6 +75,10 @@ class BabiDataset(Dataset):
         prompt_messages = messages[:-1]
         p_res = self.tokenizer.apply_chat_template(prompt_messages, tokenize=True, add_generation_prompt=True)
         prompt_ids = to_list(p_res)
+
+        # 额外的调试日志
+        if not isinstance(full_ids, list) or (len(full_ids) > 0 and not isinstance(full_ids[0], int)):
+            print(f"DEBUG: full_ids is unexpected! Type: {type(full_ids)}, First elements: {full_ids[:5] if isinstance(full_ids, list) else 'N/A'}")
         
         # 3. 转换为 Tensor 并进行类型检查
         try:
