@@ -21,38 +21,47 @@ from dygca_model import DyGCAConfig, DyGCAPlugin
 class BabiDataset(Dataset):
     """bAbI 专用数据集：支持 Qwen Instruct 对话模板、Label Masking 与 Attention Mask"""
     def __init__(self, dataset, tokenizer: PreTrainedTokenizer):
+        self.dataset = dataset
         self.tokenizer = tokenizer
-        self.samples = []
-        for item in dataset:
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": f"Story:\n{item.get('passage', '')}\nQuestion:\n{item.get('question', '')}"},
-                {"role": "assistant", "content": item.get("answer", "")}
-            ]
-            
-            # 1. 直接进行 Tokenization (tokenize=True)，避免重复 encode 和 BPE 边界问题
-            full_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
-            
-            # 2. 构造 Prompt 部分（含 Assistant 起始标记，但不含答案）
-            prompt_messages = messages[:-1]
-            prompt_ids = tokenizer.apply_chat_template(prompt_messages, tokenize=True, add_generation_prompt=True)
-            
-            # 3. 鲁棒的 Label Masking：对齐 Prompt 和 Full 序列
-            full_ids_tensor = torch.tensor(full_ids, dtype=torch.long)
-            labels = full_ids_tensor.clone()
-            labels[:len(prompt_ids)] = -100
-            
-            self.samples.append({
-                "input_ids": full_ids_tensor,
-                "labels": labels,
-                "attention_mask": torch.ones(len(full_ids), dtype=torch.long)
-            })
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        return self.samples[idx]
+        item = self.dataset[idx]
+        # 'Muennighoff/babi' 字段通常是 context, question, target 或 story, question, answer
+        story = item.get("story") or item.get("passage") or item.get("context", "")
+        question = item.get("question", "")
+        answer = item.get("answer") or item.get("target", "")
+        
+        # 使用 Instruct 模板构建对话
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that answers questions based on the provided story."},
+            {"role": "user", "content": f"Story: {story}\nQuestion: {question}"},
+            {"role": "assistant", "content": str(answer)}
+        ]
+        
+        # 1. Tokenization (显式指定 tokenize=True)
+        res = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+        full_ids = list(res) if isinstance(res, (list, tuple, torch.Tensor)) else self.tokenizer.encode(res, add_special_tokens=False)
+        
+        # 2. 构造 Prompt 部分以确定 Mask 边界
+        prompt_messages = messages[:-1]
+        p_res = self.tokenizer.apply_chat_template(prompt_messages, tokenize=True, add_generation_prompt=True)
+        prompt_ids = list(p_res) if isinstance(p_res, (list, tuple, torch.Tensor)) else self.tokenizer.encode(p_res, add_special_tokens=False)
+        
+        full_ids_tensor = torch.tensor(full_ids, dtype=torch.long)
+        labels = full_ids_tensor.clone()
+        
+        # 3. Label Masking
+        prompt_len = len(prompt_ids)
+        labels[:prompt_len] = -100
+        
+        return {
+            "input_ids": full_ids_tensor,
+            "labels": labels,
+            "attention_mask": torch.ones(len(full_ids), dtype=torch.long)
+        }
 
 def babi_collate_fn(batch, tokenizer):
     """处理不定长样本的 Padding 并生成 attention_mask"""
@@ -336,7 +345,7 @@ def main() -> int:
     if "babi" in args.dataset.lower():
         print(f"Loading bAbI dataset: {args.dataset}")
         # 从 train split 中划分 val，避免 test 数据泄露
-        full_dataset = load_dataset(args.dataset, split=args.split, trust_remote_code=True)
+        full_dataset = load_dataset(args.dataset, split=args.split)
         
         # 仅保留事实类任务 (Fact-based tasks: 1, 2, 3, 6, 10, 11, 12, 13)
         fact_tasks = {1, 2, 3, 6, 10, 11, 12, 13}
