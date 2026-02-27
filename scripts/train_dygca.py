@@ -42,13 +42,20 @@ class BabiDataset(Dataset):
         ]
         
         # 1. Tokenization (显式指定 tokenize=True)
+        def to_list(ids_or_str):
+            if isinstance(ids_or_str, str):
+                return self.tokenizer.encode(ids_or_str, add_special_tokens=False)
+            if torch.is_tensor(ids_or_str):
+                return ids_or_str.tolist()
+            return list(ids_or_str)
+
         res = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
-        full_ids = list(res) if isinstance(res, (list, tuple, torch.Tensor)) else self.tokenizer.encode(res, add_special_tokens=False)
+        full_ids = to_list(res)
         
         # 2. 构造 Prompt 部分以确定 Mask 边界
         prompt_messages = messages[:-1]
         p_res = self.tokenizer.apply_chat_template(prompt_messages, tokenize=True, add_generation_prompt=True)
-        prompt_ids = list(p_res) if isinstance(p_res, (list, tuple, torch.Tensor)) else self.tokenizer.encode(p_res, add_special_tokens=False)
+        prompt_ids = to_list(p_res)
         
         full_ids_tensor = torch.tensor(full_ids, dtype=torch.long)
         labels = full_ids_tensor.clone()
