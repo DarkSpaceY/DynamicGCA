@@ -97,30 +97,35 @@ class DyGCAPlugin(nn.Module):
         return positions
 
     def _distribution_pdf(self, params: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        # positions: (1, 1, 1, num_nodes)
+        # params: (bsz, seq_len, k_focuses, dim)
         positions = positions.clamp(1e-5, 1.0 - 1e-5)
+        
         if self.config.distribution == "beta":
-            alpha = F.softplus(params[..., 0]) + 1e-4
-            beta = F.softplus(params[..., 1]) + 1e-4
+            # 确保 alpha 和 beta 形状为 (bsz, seq_len, k_focuses, 1) 以便广播
+            alpha = F.softplus(params[..., 0:1]) + 1e-4
+            beta = F.softplus(params[..., 1:2]) + 1e-4
             dist = torch.distributions.Beta(alpha, beta)
             log_prob = dist.log_prob(positions)
         elif self.config.distribution == "gaussian":
-            mean = torch.sigmoid(params[..., 0])
-            scale = F.softplus(params[..., 1]) + 1e-4
+            mean = torch.sigmoid(params[..., 0:1])
+            scale = F.softplus(params[..., 1:2]) + 1e-4
             dist = torch.distributions.Normal(mean, scale)
             log_prob = dist.log_prob(positions)
         elif self.config.distribution == "laplace":
-            mean = torch.sigmoid(params[..., 0])
-            scale = F.softplus(params[..., 1]) + 1e-4
+            mean = torch.sigmoid(params[..., 0:1])
+            scale = F.softplus(params[..., 1:2]) + 1e-4
             dist = torch.distributions.Laplace(mean, scale)
             log_prob = dist.log_prob(positions)
         elif self.config.distribution == "studentt":
-            df = F.softplus(params[..., 0]) + 1.0
-            mean = torch.sigmoid(params[..., 1])
-            scale = F.softplus(params[..., 2]) + 1e-4
+            df = F.softplus(params[..., 0:1]) + 1.0
+            mean = torch.sigmoid(params[..., 1:2])
+            scale = F.softplus(params[..., 2:3]) + 1e-4
             dist = torch.distributions.StudentT(df, mean, scale)
             log_prob = dist.log_prob(positions)
         else:
-            raise ValueError(f"Unsupported distribution: {self.config.distribution}")
+            raise ValueError(f"Unknown distribution: {self.config.distribution}")
+        
         return torch.exp(log_prob)
 
     def _diversity_loss(self, focus_params: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
