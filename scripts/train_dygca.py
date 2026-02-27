@@ -24,6 +24,7 @@ class BabiDataset(Dataset):
     def __init__(self, dataset, tokenizer: PreTrainedTokenizer):
         self.dataset = dataset
         self.tokenizer = tokenizer
+        self._debug_count = 0  # 用于限制日志输出数量
 
     def __len__(self):
         return len(self.dataset)
@@ -42,54 +43,63 @@ class BabiDataset(Dataset):
             {"role": "assistant", "content": str(answer)}
         ]
         
+        if self._debug_count < 1:
+            print(f"\n--- [DEBUG Sample {idx}] ---")
+            print(f"Messages: {messages}")
+
         # 1. Tokenization (显式指定 tokenize=True)
-        def to_list(ids_or_res):
-            # 调试日志：查看输入类型和前几个元素
-            # print(f"DEBUG: to_list input type: {type(ids_or_res)}")
+        def to_list(ids_or_res, name="unknown"):
+            if self._debug_count < 1:
+                print(f"  [DEBUG to_list Input ({name})]: type={type(ids_or_res)}")
+                if isinstance(ids_or_res, dict):
+                    print(f"  [DEBUG to_list Keys]: {list(ids_or_res.keys())}")
             
             # 处理返回 BatchEncoding (字典) 的情况
-            if hasattr(ids_or_res, "input_ids"): # 某些 BatchEncoding 是对象
-                ids_or_res = ids_or_res["input_ids"]
-            elif isinstance(ids_or_res, dict) and "input_ids" in ids_or_res:
+            if isinstance(ids_or_res, dict) and "input_ids" in ids_or_res:
                 ids_or_res = ids_or_res["input_ids"]
             
             if isinstance(ids_or_res, str):
-                return self.tokenizer.encode(ids_or_res, add_special_tokens=False)
+                res = self.tokenizer.encode(ids_or_res, add_special_tokens=False)
+                if self._debug_count < 1: print(f"  [DEBUG to_list String Encoded]: {res[:10]}...")
+                return res
             if torch.is_tensor(ids_or_res):
-                return ids_or_res.detach().cpu().tolist()
+                res = ids_or_res.detach().cpu().tolist()
+                if self._debug_count < 1: print(f"  [DEBUG to_list Tensor to List]: {res[:10]}...")
+                return res
             # 处理 nested list 的情况 (某些 tokenizer 可能返回 [[ids]])
             if isinstance(ids_or_res, (list, tuple)) and len(ids_or_res) > 0 and isinstance(ids_or_res[0], (list, tuple)):
-                return list(ids_or_res[0])
+                res = list(ids_or_res[0])
+                if self._debug_count < 1: print(f"  [DEBUG to_list Nested List]: {res[:10]}...")
+                return res
             
-            # 最后的保险：如果还是字典或非列表，强制转换前打印
-            try:
-                return list(ids_or_res)
-            except Exception as e:
-                print(f"DEBUG ERROR: Failed to convert to list. Type: {type(ids_or_res)}, Value: {str(ids_or_res)[:200]}")
-                raise e
+            res = list(ids_or_res)
+            if self._debug_count < 1: print(f"  [DEBUG to_list Final List]: {res[:10]}...")
+            return res
 
-        res = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
-        full_ids = to_list(res)
-        
-        # 2. 构造 Prompt 部分以确定 Mask 边界
-        prompt_messages = messages[:-1]
-        p_res = self.tokenizer.apply_chat_template(prompt_messages, tokenize=True, add_generation_prompt=True)
-        prompt_ids = to_list(p_res)
-
-        # 额外的调试日志
-        if not isinstance(full_ids, list) or (len(full_ids) > 0 and not isinstance(full_ids[0], int)):
-            print(f"DEBUG: full_ids is unexpected! Type: {type(full_ids)}, First elements: {full_ids[:5] if isinstance(full_ids, list) else 'N/A'}")
-        
-        # 3. 转换为 Tensor 并进行类型检查
         try:
+            res = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+            full_ids = to_list(res, name="full_ids")
+            
+            # 2. 构造 Prompt 部分以确定 Mask 边界
+            prompt_messages = messages[:-1]
+            p_res = self.tokenizer.apply_chat_template(prompt_messages, tokenize=True, add_generation_prompt=True)
+            prompt_ids = to_list(p_res, name="prompt_ids")
+            
+            if self._debug_count < 1:
+                print(f"  [DEBUG IDs Lengths]: full={len(full_ids)}, prompt={len(prompt_ids)}")
+                self._debug_count += 1
+
+            # 3. 转换为 Tensor 并进行类型检查
             full_ids_tensor = torch.tensor(full_ids, dtype=torch.long)
+            
         except Exception as e:
-            # 最后的防线：如果还是失败，尝试强制转换每个元素
-            try:
-                full_ids_tensor = torch.tensor([int(x) for x in full_ids], dtype=torch.long)
-            except:
-                print(f"Failed to convert full_ids: {full_ids}")
-                raise e
+            print(f"\n!!! [ERROR in __getitem__ at idx {idx}] !!!")
+            print(f"Exception: {type(e).__name__}: {e}")
+            if 'full_ids' in locals():
+                print(f"full_ids (first 20): {full_ids[:20]}")
+                if len(full_ids) > 0:
+                    print(f"full_ids element types: {[type(x) for x in full_ids[:5]]}")
+            raise e
 
         labels = full_ids_tensor.clone()
         
@@ -97,10 +107,21 @@ class BabiDataset(Dataset):
         prompt_len = len(prompt_ids)
         labels[:prompt_len] = -100
         
+        # 4. Attention Mask (Qwen 需要)
+        attention_mask = torch.ones_like(full_ids_tensor)
+        
+        # 调试信息
+        if self._debug_count == 1: # 刚才 +1 了
+            print(f"  [DEBUG Final]: input_ids={full_ids_tensor.shape}, labels={labels.shape}, mask={attention_mask.shape}")
+            # 检查 labels 是否包含 -100
+            mask_count = (labels == -100).sum().item()
+            print(f"  [DEBUG Labels]: -100 count = {mask_count} / {len(labels)}")
+            self._debug_count += 1
+
         return {
             "input_ids": full_ids_tensor,
             "labels": labels,
-            "attention_mask": torch.ones(len(full_ids), dtype=torch.long)
+            "attention_mask": attention_mask
         }
 
 def babi_collate_fn(batch, tokenizer):
