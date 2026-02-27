@@ -249,9 +249,10 @@ class DyGCAPlugin(nn.Module):
         importance[:, 1:] = importance_raw[:, :-1]
         
         # 3.2: Normalized coordinates x_j = (j + 0.5) / N
-        pos = self._build_positions(seq_len, device).view(seq_len, 1, 1, 1)
-        pdf = self._distribution_pdf(focus_params, pos) # (seq_len, bsz, s, k)
-        pdf = pdf.permute(1, 2, 3, 0) # (bsz, seq_len, k, seq_len)
+        # 修正维度以支持正确广播: (1, 1, 1, seq_len)
+        pos = self._build_positions(seq_len, device).view(1, 1, 1, seq_len)
+        pdf = self._distribution_pdf(focus_params, pos) # (bsz, seq_len, k, seq_len)
+        # 不再需要 permute，因为 pos 在最后一维，广播后结果即为 (bsz, seq_len, k, seq_len)
         
         # 3.2: w_tilde normalization
         causal = self._causal_mask(seq_len, device).view(1, seq_len, 1, seq_len)
