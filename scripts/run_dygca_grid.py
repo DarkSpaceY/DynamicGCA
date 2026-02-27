@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=1, help="Micro-batch size per step")
     parser.add_argument("--grad-accum-steps", type=int, default=64, help="Gradient accumulation steps")
-    parser.add_argument("--max-steps", type=int, default=10000)
+    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--target-acc", type=float, default=0.95)
     parser.add_argument("--device", type=str, default="auto", choices=["cpu", "cuda", "mps", "auto"])
     parser.add_argument("--distributions", default="beta,gaussian,laplace,studentt")
@@ -60,6 +60,7 @@ def main() -> int:
                         "--save-dir", save_dir,
                         "--target-acc", str(args.target_acc),
                         "--grad-accum-steps", str(args.grad_accum_steps),
+                        "--epochs", str(args.epochs),
                     ]
                     
                     if chunk == "off":

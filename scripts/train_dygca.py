@@ -139,7 +139,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-model", default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--max-steps", type=int, default=1000)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--val-split", type=str, default="test")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--use-lora", action="store_true", default=True)
     parser.add_argument("--lora-r", type=int, default=16)
@@ -225,6 +226,34 @@ def train_step(model: DyGCAPlugin, batch: dict[str, torch.Tensor], device: torch
     }
 
 
+def validate_step(model: DyGCAPlugin, dataloader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    total_correct = 0
+    total_tokens = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            
+            outputs = model(input_ids, labels=labels, attention_mask=attention_mask)
+            logits = outputs["logits"]
+            
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            mask = (shift_labels != -100)
+            preds = shift_logits.argmax(dim=-1)
+            correct = (preds == shift_labels) & mask
+            
+            total_correct += int(correct.sum().item())
+            total_tokens += int(mask.sum().item())
+            
+    model.train()
+    return total_correct / (total_tokens + 1e-9)
+
+
 def main() -> int:
     args = parse_args()
     
@@ -262,6 +291,12 @@ def main() -> int:
         dataset = load_dataset(args.dataset, split=args.split, trust_remote_code=True)
         train_dataset = BabiDataset(dataset, tokenizer)
         dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=babi_collate_fn)
+        
+        # 加载验证集 (通常是 'test' split 在 bAbI 数据集中作为验证集使用)
+        print(f"Loading bAbI validation dataset: split={args.val_split}")
+        val_data = load_dataset(args.dataset, split=args.val_split, trust_remote_code=True)
+        val_dataset = BabiDataset(val_data, tokenizer)
+        val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=babi_collate_fn)
     else:
         print(f"Loading dataset: {args.dataset} (config={args.config})")
         dataset = load_dataset(args.dataset, args.config, split=args.split, streaming=not args.no_streaming)
@@ -274,6 +309,8 @@ def main() -> int:
         else:
             train_dataset = TokenStreamDataset(tokens)
             dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=general_collate_fn)
+        # 非 bAbI 数据集暂时不启用验证集早停，或者可以根据需要后续添加
+        val_dataloader = None
 
     base_model = AutoModelForCausalLM.from_pretrained(
         args.base_model, 
@@ -322,68 +359,64 @@ def main() -> int:
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
     # 3. Training Loop
     model.train()
-    data_iter = iter(dataloader)
     
-    total_correct = 0
-    total_tokens = 0
-    epoch_samples = 0
-    accum_loss = 0.0
-    accum_accuracy = 0.0
+    print(f"Starting training for {args.epochs} epochs (Effective Batch Size: {args.batch_size * args.grad_accum_steps})...")
     
-    print(f"Starting training for {args.max_steps} steps (Effective Batch Size: {args.batch_size * args.grad_accum_steps})...")
+    early_stop = False
+    global_step = 0
     
-    # 使用 tqdm 进度条
-    pbar = tqdm(range(args.max_steps), desc="Training")
-    
-    for step in pbar:
-        batch = next(data_iter, None)
-        if batch is None:
-            # Epoch 结束统计
-            global_acc = total_correct / (total_tokens + 1e-9)
-            tqdm.write(f"\n[Epoch End] Global Accuracy: {global_acc:.4f}")
+    for epoch in range(args.epochs):
+        if early_stop:
+            break
             
-            if global_acc >= args.target_acc:
-                tqdm.write(f"Target global accuracy {args.target_acc} reached. Stopping training.")
-                break
+        # 使用 tqdm 进度条显示当前 Epoch
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        
+        accum_loss = 0.0
+        accum_accuracy = 0.0
+        
+        for micro_step, batch in enumerate(pbar):
+            metrics = train_step(model, batch, device, grad_accum_steps=args.grad_accum_steps)
+            
+            accum_loss += metrics['loss']
+            accum_accuracy += metrics['accuracy']
+            
+            # 梯度更新逻辑 (每个有效 Batch)
+            if (micro_step + 1) % args.grad_accum_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
                 
-            total_correct = 0
-            total_tokens = 0
-            epoch_samples = 0
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
-            
-        metrics = train_step(model, batch, device, grad_accum_steps=args.grad_accum_steps)
-        
-        # 累积全局统计
-        total_correct += metrics['correct_tokens']
-        total_tokens += metrics['total_tokens']
-        epoch_samples += len(batch['input_ids'])
-        
-        accum_loss += metrics['loss']
-        accum_accuracy += metrics['accuracy']
-        
-        # 梯度更新逻辑
-        if (step + 1) % args.grad_accum_steps == 0:
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            
-            # 只有在权重更新时才计算平均指标
-            avg_loss = accum_loss / args.grad_accum_steps
-            avg_acc = accum_accuracy / args.grad_accum_steps
-            
-            # 更新进度条信息
-            pbar.set_postfix({
-                "loss": f"{avg_loss:.4f}",
-                "acc": f"{avg_acc:.4f}",
-                "global_acc": f"{total_correct/(total_tokens+1e-9):.4f}"
-            })
-            
-            accum_loss = 0.0
-            accum_accuracy = 0.0
+                # 权重更新后，进行验证 (如果存在验证集)
+                val_acc = 0.0
+                if val_dataloader is not None:
+                    val_acc = validate_step(model, val_dataloader, device)
+                
+                # 只有在权重更新时才计算平均训练指标
+                avg_loss = accum_loss / args.grad_accum_steps
+                avg_acc = accum_accuracy / args.grad_accum_steps
+                
+                # 更新进度条信息
+                metrics_to_show = {
+                    "loss": f"{avg_loss:.4f}",
+                    "train_acc": f"{avg_acc:.4f}",
+                }
+                if val_dataloader is not None:
+                    metrics_to_show["val_acc"] = f"{val_acc:.4f}"
+                pbar.set_postfix(metrics_to_show)
+                
+                # 检查早停条件 (仅当有验证集时)
+                if val_dataloader is not None and val_acc >= args.target_acc:
+                    tqdm.write(f"\n[Early Stop] Validation accuracy {val_acc:.4f} reached target {args.target_acc}!")
+                    early_stop = True
+                    break
+                
+                accum_loss = 0.0
+                accum_accuracy = 0.0
 
-        if (step + 1) % 10 == 0 and (step + 1) % args.grad_accum_steps != 0:
-            # 中间步骤仅更新 postfix，不打印新行以保持进度条整洁
-            pbar.set_postfix({"step_loss": f"{metrics['loss']:.4f}", "step_acc": f"{metrics['accuracy']:.4f}"})
+            elif (micro_step + 1) % 10 == 0:
+                # 中间微步仅更新 postfix
+                pbar.set_postfix({"micro_loss": f"{metrics['loss']:.4f}"})
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
         save_path = os.path.join(args.save_dir, "dygca.pt")
