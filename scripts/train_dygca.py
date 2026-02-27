@@ -14,7 +14,7 @@ from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer
-from scripts.utils import is_model_cached, is_dataset_cached
+from utils import is_model_cached, is_dataset_cached
 
 from dygca_model import DyGCAConfig, DyGCAPlugin
 

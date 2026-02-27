@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 import torch
-from scripts.utils import is_model_cached, is_dataset_cached
+from utils import is_model_cached, is_dataset_cached
 
 from dygca_model import DyGCAConfig, DyGCAPlugin
 
