@@ -33,6 +33,7 @@ class DyGCAPlugin(nn.Module):
         self.base_model = base_model
         self.config = config
         self.focus_param_dim = self._focus_param_dim(config.distribution)
+        self._debug_count = 0  # 用于限制日志输出频率
         
         # 3.2 Soft Chunk Construction: MLP maps H(L-1) to {alpha, beta, a}
         self.focus_proj = nn.Linear(config.hidden_size, config.k_focuses * self.focus_param_dim)
@@ -208,10 +209,17 @@ class DyGCAPlugin(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         
+        # 调试日志限制
+        show_debug = self._debug_count < 3
+        if show_debug:
+            print(f"\n[DEBUG DyGCA] forward start: bsz={bsz}, seq_len={seq_len}")
+
         # 3.2: Input embeddings E_j
         base = self.base_model.get_input_embeddings()(input_ids)
         # Apply RoPE to input embeddings (Section 3.2: tilde{E}_j = RoPE(E_j, j))
         base = self._apply_rope(base)
+        if show_debug:
+            print(f"[DEBUG DyGCA] base embeddings (RoPE): {base.shape}")
         
         outputs = self.base_model(
             input_ids=input_ids,
@@ -223,11 +231,13 @@ class DyGCAPlugin(nn.Module):
         )
         
         # Section 3.1: Hidden representation of penultimate layer (L-1)
-        # outputs.hidden_states[0] is embedding, [1...L] are layer outputs
         h_penultimate = outputs.hidden_states[-2] 
         # Section 3.3: Query from final layer (L)
         h_final = outputs.hidden_states[-1]
         
+        if show_debug:
+            print(f"[DEBUG DyGCA] h_penultimate: {h_penultimate.shape}, h_final: {h_final.shape}")
+
         target_dtype = self.focus_proj.weight.dtype
         h_penultimate = h_penultimate.to(target_dtype)
         h_final = h_final.to(target_dtype)
@@ -248,70 +258,75 @@ class DyGCAPlugin(nn.Module):
         focus_params[:, 1:] = focus_params_raw[:, :-1]
         importance[:, 1:] = importance_raw[:, :-1]
         
+        if show_debug:
+            print(f"[DEBUG DyGCA] focus_params: {focus_params.shape}, importance: {importance.shape}")
+
         # 3.2: Normalized coordinates x_j = (j + 0.5) / N
         # 修正维度以支持正确广播: (1, 1, 1, seq_len)
         pos = self._build_positions(seq_len, device).view(1, 1, 1, seq_len)
         pdf = self._distribution_pdf(focus_params, pos) # (bsz, seq_len, k, seq_len)
-        # 不再需要 permute，因为 pos 在最后一维，广播后结果即为 (bsz, seq_len, k, seq_len)
         
+        if show_debug:
+            print(f"[DEBUG DyGCA] positions: {pos.shape}, pdf: {pdf.shape}")
+
         # 3.2: w_tilde normalization
         causal = self._causal_mask(seq_len, device).view(1, seq_len, 1, seq_len)
         pdf = pdf * causal
         
         # 应用 attention_mask 排除 Padding Token 对焦点概率的影响
         if attention_mask is not None:
-            # attention_mask: (bsz, seq_len) -> (bsz, 1, 1, seq_len)
             mask = attention_mask.view(bsz, 1, 1, seq_len).to(pdf.dtype)
             pdf = pdf * mask
             
         probs = pdf / (pdf.sum(dim=-1, keepdim=True) + 1e-9)
-        
+        if show_debug:
+            print(f"[DEBUG DyGCA] probs: {probs.shape}")
+
         # 3.2: w_k,j = a_k * w_tilde
-        # importance shape: (bsz, seq_len, k)
         weights = probs * importance.unsqueeze(-1)
         
         # 3.2: Chunk vectors C_k = sum(w_k,j * E_j)
         if self.chunk_attn is None:
-            # Simple weighted pooling
             chunk_vectors = (weights.unsqueeze(-1) * base.unsqueeze(1).unsqueeze(2)).sum(dim=3)
         else:
-            # Optional Chunk Self-Attention
             weighted_tokens = base.unsqueeze(1).unsqueeze(2) * probs.unsqueeze(-1)
-            # RuntimeError: view size is not compatible with input tensor's size and stride
-            # 使用 .reshape() 代替 .view()，或者在 .view() 前调用 .contiguous()
             attn_in = weighted_tokens.reshape(bsz * seq_len * self.config.k_focuses, seq_len, -1)
             attn_out, _ = self.chunk_attn(attn_in, attn_in, attn_in, need_weights=False)
             attn_out = attn_out.view(bsz, seq_len, self.config.k_focuses, seq_len, -1)
-            # Apply importance magnitude after chunk attention
             chunk_vectors = (attn_out * weights.unsqueeze(-1)).sum(dim=3)
             
+        if show_debug:
+            print(f"[DEBUG DyGCA] chunk_vectors: {chunk_vectors.shape}")
+
         # 3.3: Selection of M focuses (Refinement)
         topk_indices = torch.topk(importance, self.config.m_selection, dim=-1).indices
         topk_expand = topk_indices.unsqueeze(-1).expand(-1, -1, -1, chunk_vectors.shape[-1])
         selected_chunks = torch.gather(chunk_vectors, 2, topk_expand)
         
+        if show_debug:
+            print(f"[DEBUG DyGCA] selected_chunks (M={self.config.m_selection}): {selected_chunks.shape}")
+
         # 3.3: Cross-Attention Fusion
         q = self.q_proj(h_final)
         k = self.k_proj(selected_chunks)
         v = self.v_proj(selected_chunks)
         
-        # (bsz, seq_len, 1, h) * (bsz, seq_len, m, h) -> (bsz, seq_len, m)
         scores = (q.unsqueeze(2) * k).sum(dim=-1) / math.sqrt(h_final.shape[-1])
         attn = torch.softmax(scores, dim=-1)
         f_t = torch.einsum("bsm,bsmh->bsh", attn, v)
         
+        if show_debug:
+            print(f"[DEBUG DyGCA] fusion output f_t: {f_t.shape}")
+
         # 3.4: Gated Integration
         if self.gate_mlp is not None:
-            # g_t = sigma(w_g^T [H(L-1); C_mean] + b_g)
-            c_mean = chunk_vectors.mean(dim=2) # Mean over K focuses
+            c_mean = chunk_vectors.mean(dim=2)
             gate_input = torch.cat([h_penultimate, c_mean], dim=-1)
             g_t = torch.sigmoid(self.gate_mlp(gate_input))
-            
-            # O_t = g_t * F_t + (1 - g_t) * S_t
-            # S_t is the standard self-attention output (h_final)
             hidden = g_t * f_t + (1.0 - g_t) * h_final
+            if show_debug:
+                print(f"[DEBUG DyGCA] gate g_t: {g_t.shape}, final hidden: {hidden.shape}")
         else:
-            # Contrast test: Simple Addition (Add)
             hidden = h_final + f_t
             
         hidden = self.out_ln(hidden)
@@ -330,7 +345,6 @@ class DyGCAPlugin(nn.Module):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
-            # 3.5: JS Divergence via Gauss-Legendre Quadrature (Continuous Space)
             diversity_loss = self._diversity_loss(focus_params, attention_mask=attention_mask)
             loss = lm_loss + self.config.diversity_lambda * diversity_loss
             output.update({
@@ -338,4 +352,8 @@ class DyGCAPlugin(nn.Module):
                 "lm_loss": lm_loss,
                 "diversity_loss": diversity_loss,
             })
+            if show_debug:
+                print(f"[DEBUG DyGCA] lm_loss: {lm_loss.item():.4f}, div_loss: {diversity_loss.item():.4f}\n")
+
+        self._debug_count += 1
         return output

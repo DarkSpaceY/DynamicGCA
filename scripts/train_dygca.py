@@ -280,13 +280,27 @@ def make_dataloader(token_iter: Iterable[list[int]], seq_len: int, batch_size: i
     return DataLoader(dataset, batch_size=batch_size)
 
 
+_train_debug_count = 0
+
 def train_step(model: DyGCAPlugin, batch: dict[str, torch.Tensor], device: torch.device, grad_accum_steps: int = 1) -> dict:
+    global _train_debug_count
     input_ids = batch["input_ids"].to(device)
     labels = batch["labels"].to(device)
     # 获取并透传 attention_mask
     attention_mask = batch.get("attention_mask")
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
+    
+    # 调试日志：检查输入端形状
+    if _train_debug_count < 3:
+        print(f"\n[DEBUG Train Input] Step {_train_debug_count}")
+        print(f"  - input_ids shape: {input_ids.shape}")
+        print(f"  - labels shape:    {labels.shape}")
+        if attention_mask is not None:
+            print(f"  - mask shape:      {attention_mask.shape}")
+        else:
+            print(f"  - mask:            None")
+        _train_debug_count += 1
         
     outputs = model(input_ids, labels=labels, attention_mask=attention_mask)
     
